@@ -1,4 +1,4 @@
-# Connect to Microsoft Graph using the identity of the logged-in user
+# Connect to Microsoft Graph using the system-managed identity
 Connect-MgGraph -Identity
 
 # Get the group of users
