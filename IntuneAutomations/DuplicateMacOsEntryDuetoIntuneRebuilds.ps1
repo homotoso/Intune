@@ -28,7 +28,7 @@ Connect-MgGraph -AccessToken $accesstokenfinal -nowelcome
 $IntuneDevices = Get-MgDevice -ALL -Filter "OperatingSystem eq 'MacMDM'"| Where-Object EnrollmentProfileName -eq "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 # Retrieve all Intune devices with operating systems that start with 'Mac' and TrustType 'AzureAD'
-$IntuneDevices = Get-MgDevice -Filter "startswith(OperatingSystem,'Mac')"| Where-Object TrustType -eq "AzureAD"
+#$IntuneDevices = Get-MgDevice -Filter "startswith(OperatingSystem,'Mac')"| Where-Object TrustType -eq "AzureAD"
 
 # Group the Intune devices by DisplayName
 $IntuneDeviceGroups = $IntuneDevices | Group-Object -Property DisplayName
