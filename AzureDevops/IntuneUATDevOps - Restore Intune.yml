@@ -1,1 +1,52 @@
-
+variables:
+- name: RESTORE_FOLDER
+  value: uat-restore
+- name: TENANT_NAME
+  value: XXXXXXXXXXXXXXXXXX
+- name: SERVICE_CONNECTION_NAME
+  value: XXXXXXXXXXXXXXXXXX
+- name: USER_EMAIL
+  value: XXXXXXXXXXXXXXXXXX
+- name: USER_NAME
+  value: XXXXXXXXXXXXXXXXXX
+stages:
+- stage: __default
+  jobs:
+  - job: restore_intune
+    displayName: restore & commit Intune configuration
+    pool:
+      vmImage: ubuntu-latest
+    continueOnError: false
+    steps:
+    - task: 6d15af64-176c-496d-b583-fd2ae21d4df4@1
+      inputs:
+        repository: self
+        persistCredentials: true
+    - task: Bash@3
+      displayName: Install IntuneCD
+      inputs:
+        targetType: "inline"
+        script: |
+          pip3 install IntuneCD
+        workingDirectory: "$(Build.SourcesDirectory)"
+        failOnStderr: true
+    - task: AzurePowerShell@5
+      displayName: "Get Graph Token for Workload Federated Credential"
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION_NAME)
+        azurePowerShellVersion: "LatestVersion"
+        ScriptType: "inlineScript"
+        Inline: |
+          $accessToken = (Get-AzAccessToken -ResourceTypeName MSGraph -ErrorAction Stop).Token
+          Write-Host "##vso[task.setvariable variable=accessToken;issecret=true]$accessToken"
+    - task: Bash@3
+      displayName: Restore Intune Profile
+      inputs:
+        targetType: "inline"
+        script: |
+          IntuneCD-startupdate \
+              -t $(accessToken) \
+              --mode=1 \
+              --path="$(Build.SourcesDirectory)/$(RESTORE_FOLDER)"
+        workingDirectory: "$(Build.SourcesDirectory)"
+        failOnStderr: true
