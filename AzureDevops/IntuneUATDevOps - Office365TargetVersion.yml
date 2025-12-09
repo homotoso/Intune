@@ -1,0 +1,465 @@
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+schedules:
+  # Azure Pipelines cron is UTC. Use two entries to cover DST for Europe/London.
+  # 09:00 London during GMT (UTC=09:00)
+  - cron: "0 9 * * 3"
+    displayName: "Wednesdays 09:00 GMT (London)"
+    always: true
+    branches:
+      include:
+        - main
+
+  # 09:00 London during BST (UTC=08:00)
+  - cron: "0 8 * * 3"
+    displayName: "Wednesdays 09:00 BST (London)"
+    always: true
+    branches:
+      include:
+        - main
+
+variables:
+  policyId: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  # Child simple string setting for Office Target Version (from your JSON)
+  settingId: "device_vendor_msft_policy_config_office16v2~policy~l_microsoftofficemachine~l_updates_l_updatetargetversion_l_updatetargetversionid"
+
+  # --- Assignment controls ---
+  assignToGroup: "false"                # flip to "true" when you want the step to run
+  assignGroupBy: "name"                 # "id" or "name"
+  targetGroupId: ""                     # if assignGroupBy = "id", put the GUID here
+  targetGroupName: "xxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # if assignGroupBy = "name", exact displayName
+
+stages:
+# -------------------------
+# Stage 0: Gate stage — compute "Wednesday after 2nd Tuesday" in Europe/London and expose as output var
+# -------------------------
+- stage: Gate
+  displayName: "Gate: Only run on the Wednesday after the 2nd Tuesday"
+  jobs:
+  - job: GateJob
+    displayName: "Compute monthly run day (Europe/London)"
+    steps:
+    - task: PowerShell@2
+      name: gateVars
+      displayName: "Set IsRunDay output variable"
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("Europe/London")
+          $nowUtc = [DateTime]::UtcNow
+          $nowLon = [System.TimeZoneInfo]::ConvertTimeFromUtc($nowUtc, $tz)
+
+          # Compute 2nd Tuesday of this month (London local), then +1 day (Wednesday)
+          $monthStart = [DateTime]::new($nowLon.Year, $nowLon.Month, 1)
+          $offsetToTue = ([int][DayOfWeek]::Tuesday - [int]$monthStart.DayOfWeek + 7) % 7
+          $firstTuesday  = $monthStart.AddDays($offsetToTue)
+          $secondTuesday = $firstTuesday.AddDays(7)
+          $targetWednesday = $secondTuesday.AddDays(1)
+
+          $isRunDay = ($nowLon.Date -eq $targetWednesday.Date) -and ($nowLon.DayOfWeek -eq 'Wednesday')
+
+          Write-Host "London now: $nowLon"
+          Write-Host "Second Tuesday: $secondTuesday | Target Wednesday: $targetWednesday | IsRunDay=$isRunDay"
+
+          if ($isRunDay) {
+            Write-Host "##vso[task.setvariable variable=IsRunDay;isOutput=true]true"
+          } else {
+            Write-Host "##vso[task.setvariable variable=IsRunDay;isOutput=true]false"
+          }
+
+# -------------------------
+# Stage 1: Run pipeline only if 2nd Wednesday
+# -------------------------
+- stage: RunOnTargetWednesday
+  displayName: "Run Intune MEC Pipeline (only 2nd-Tuesday+1 Wednesday)"
+  condition: and(succeeded(), eq(dependencies.Gate.outputs['GateJob.gateVars.IsRunDay'], 'true'))
+  jobs:
+  - job: Main
+    displayName: "Intune MEC Target Version Automation"
+    steps:
+      # 1) Get Microsoft Graph token via your service connection
+      - task: AzureCLI@2
+        displayName: "Get Microsoft Graph Access Token"
+        inputs:
+          azureSubscription: "xxxxxxxxxxxxxxxxxxx"   # <-- your service connection name
+          scriptType: pscore
+          scriptLocation: inlineScript
+          inlineScript: |
+            $token = az account get-access-token --resource "https://graph.microsoft.com" --query accessToken -o tsv
+            echo "##vso[task.setvariable variable=secretToken;issecret=true]$token"
+
+      # 2) Get latest Monthly Enterprise Channel version (e.g., 16.0.18925.20216)
+      - task: PowerShell@2
+        displayName: "Get Latest MEC Target Version"
+        inputs:
+          targetType: inline
+          pwsh: true
+          script: |
+            $cdnUrl = "https://learn.microsoft.com/en-us/officeupdates/monthly-enterprise-channel"
+            $html = Invoke-WebRequest -Uri $cdnUrl -UseBasicParsing
+
+            # Match "(Build 18925.20216)" and capture 18925.20216
+            $pattern = 'Build\s+(\d{5}\.\d{5})'
+            $match = [regex]::Match($html.Content, $pattern)
+            if (-not $match.Success) {
+              throw "Could not find latest Monthly Enterprise Channel build number."
+            }
+
+            $buildNumber = $match.Groups[1].Value
+            $latestVersion = "16.0.$buildNumber"
+
+            Write-Host "Latest Monthly Enterprise Channel Version: $latestVersion"
+            echo "##vso[task.setvariable variable=latestVersion]$latestVersion"
+
+      # 3) Compare current Intune Target Version to latest (supports flat & nested shapes)
+      - task: PowerShell@2
+        displayName: "Compare Intune Target Version to Latest"
+        env:
+          secretToken: $(secretToken)
+        inputs:
+          targetType: inline
+          pwsh: true
+          script: |
+            $policyId      = "$(policyId)"
+            $settingId     = "$(settingId)"
+            $latestVersion = "$(latestVersion)"
+            $headers = @{ Authorization = "Bearer $env:secretToken" }
+
+            $uri = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies/$policyId/settings"
+            $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+            if (-not $resp.value) { throw "No settings returned from Graph for policy $policyId" }
+
+            # Find the item by child settingDefinitionId or by parent choice id
+            $item = $resp.value | Where-Object {
+              $_.settingDefinitionId -eq $settingId -or $_.settingInstance.settingDefinitionId -eq $settingId
+            } | Select-Object -First 1
+
+            if (-not $item) {
+              $parentChoiceId = "device_vendor_msft_policy_config_office16v2~policy~l_microsoftofficemachine~l_updates_l_updatetargetversion"
+              $item = $resp.value | Where-Object {
+                $_.settingDefinitionId -eq $parentChoiceId -or $_.settingInstance.settingDefinitionId -eq $parentChoiceId
+              } | Select-Object -First 1
+            }
+
+            if (-not $item) { throw "Could not locate the target version setting in policy $policyId." }
+
+            # Extract the current value from flat or nested shapes
+            $currentVersion = $null
+
+            # Flat: top-level simpleSettingValue.value
+            if ($item.PSObject.Properties.Name -contains 'simpleSettingValue' -and $item.simpleSettingValue) {
+              $currentVersion = $item.simpleSettingValue.value
+            }
+
+            # Nested: settingInstance (simple or choice->children->simple)
+            if (-not $currentVersion -and $item.settingInstance) {
+              if ($item.settingInstance.simpleSettingValue) {
+                $currentVersion = $item.settingInstance.simpleSettingValue.value
+              } elseif ($item.settingInstance.choiceSettingValue -and $item.settingInstance.choiceSettingValue.children) {
+                $child = $item.settingInstance.choiceSettingValue.children |
+                  Where-Object { $_.settingDefinitionId -eq $settingId } |
+                  Select-Object -First 1
+                if ($child -and $child.simpleSettingValue) {
+                  $currentVersion = $child.simpleSettingValue.value
+                }
+              }
+            }
+
+            if (-not $currentVersion) { throw "Could not retrieve current version value from the setting instance." }
+
+            Write-Host "Current Intune Target Version: $currentVersion"
+            Write-Host "Latest Version from CDN:       $latestVersion"
+
+            if ([Version]$latestVersion -gt [Version]$currentVersion) {
+              Write-Host "Newer version detected. Update required."
+              echo "##vso[task.setvariable variable=needsUpdate]true"
+            } else {
+              Write-Host "No update needed."
+              echo "##vso[task.setvariable variable=needsUpdate]false"
+            }
+
+      # 3.5) Assert policy channel is Monthly Enterprise
+      - task: PowerShell@2
+        displayName: "Assert policy channel is Monthly Enterprise"
+        env:
+          secretToken: $(secretToken)
+        inputs:
+          targetType: inline
+          pwsh: true
+          script: |
+            $policyId = "$(policyId)"
+            $headers = @{ Authorization = "Bearer $env:secretToken" }
+
+            $uri = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies/$policyId/settings"
+            $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -ErrorAction Stop
+            if (-not $resp.value) { throw "No settings returned from Graph for policy $policyId" }
+
+            # Find the "update branch" child choice setting (...updatebranchid)
+            $branchChoiceValue = $null
+            foreach ($s in $resp.value) {
+              $si = $s.settingInstance
+              if ($si -and $si.choiceSettingValue -and $si.choiceSettingValue.children) {
+                $child = $si.choiceSettingValue.children | Where-Object { $_.settingDefinitionId -like "*updatebranchid" } | Select-Object -First 1
+                if ($child -and $child.choiceSettingValue -and $child.choiceSettingValue.value) {
+                  $branchChoiceValue = $child.choiceSettingValue.value
+                  break
+                }
+              }
+            }
+
+            if (-not $branchChoiceValue) {
+              Write-Host "Could not find update branch choice setting (…updatebranchid)."
+              echo "##vso[task.setvariable variable=channelOk]false"
+              throw "Policy missing 'Update Branch' setting; cannot safely apply target version."
+            }
+
+            Write-Host "Detected Update Branch choice value: $branchChoiceValue"
+            if ($branchChoiceValue -match "monthlyenterprise$") {
+              Write-Host "Channel is Monthly Enterprise"
+              echo "##vso[task.setvariable variable=channelOk]true"
+            } else {
+              Write-Host "Channel is NOT Monthly Enterprise"
+              echo "##vso[task.setvariable variable=channelOk]false"
+              throw "Policy channel is not Monthly Enterprise ($branchChoiceValue). Refusing to update Target Version."
+            }
+
+      # 4) Create NEW Settings Catalog policy WITH settings (no assignments), bumping Office Target Version
+      - task: PowerShell@2
+        displayName: "Create new policy (with settings) & update Office Target Version"
+        condition: and(succeeded(), eq(variables['needsUpdate'], 'true'), eq(variables['channelOk'], 'true'))
+        env:
+          secretToken: $(secretToken)
+        inputs:
+          targetType: inline
+          pwsh: true
+          script: |
+            $ErrorActionPreference = 'Stop'
+
+            $policyId         = "$(policyId)"
+            $childStringDefId = "$(settingId)"   # child definition id for Office Target Version
+            $latestVersion    = "$(latestVersion)"
+
+            $headers = @{
+              Authorization = "Bearer $env:secretToken"
+              "Content-Type" = "application/json"
+              "Accept"       = "application/json"
+            }
+
+            # 4.1 Read source policy + settings
+            $srcPolicyUri   = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies/$policyId"
+            $srcSettingsUri = "$srcPolicyUri/settings"
+            $srcPolicy   = Invoke-RestMethod -Uri $srcPolicyUri   -Headers $headers -Method Get
+            $srcSettings = Invoke-RestMethod -Uri $srcSettingsUri -Headers $headers -Method Get
+
+            if (-not $srcPolicy.id)      { throw "Source policy not found: $policyId" }
+            if (-not $srcSettings.value) { throw "No settings on source policy $policyId" }
+
+            # 4.2 Build NEW settings array: clone each instance; bump only the Office Target Version child value
+            $newSettings = @()
+
+            foreach ($s in $srcSettings.value) {
+              # Clone the instance to avoid mutating the original object
+              $inst = $s.settingInstance | ConvertTo-Json -Depth 100 | ConvertFrom-Json
+
+              # If this instance contains the child definition for Target Version, update its simple string value
+              if ($inst.'@odata.type' -eq "#microsoft.graph.deviceManagementConfigurationChoiceSettingInstance" -and
+                  $inst.choiceSettingValue -and
+                  $inst.choiceSettingValue.children -and
+                  ($inst.choiceSettingValue.children.settingDefinitionId -contains $childStringDefId)) {
+
+                $child = $inst.choiceSettingValue.children |
+                  Where-Object { $_.settingDefinitionId -eq $childStringDefId } |
+                  Select-Object -First 1
+
+                if ($child -and $child.simpleSettingValue) {
+                  $old = $child.simpleSettingValue.value
+                  $child.simpleSettingValue.value = $latestVersion
+                  Write-Host "Updated Office Target Version: $old -> $latestVersion"
+                }
+              }
+
+              # Wrap as a deviceManagementConfigurationSetting (omit 'id' — let Graph generate)
+              $newSettings += [ordered]@{
+                "@odata.type"   = "#microsoft.graph.deviceManagementConfigurationSetting"
+                "settingInstance" = $inst
+              }
+            }
+
+            # 4.3 Create the NEW policy in one POST including 'settings' (leave unassigned)
+            $newName = "{0} - MEC {1} ({2})" -f $srcPolicy.name, $latestVersion, (Get-Date).ToString('yyyyMMdd-HHmm')
+
+            # Build a stable prefix that ignores the timestamp part
+            $baseName = "{0} - MEC {1}" -f $srcPolicy.name, $latestVersion
+            
+            # Client-side prefix guard (fast: selects only id,name; breaks on first hit)
+            $hit = $null
+            $next = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies?`$select=id,name&`$top=100"
+            while ($next) {
+              $page = Invoke-RestMethod -Headers $headers -Method Get -Uri $next
+              if ($page.value) {
+                # Match any policy whose name starts with the base prefix (ignores timestamp)
+                $hit = $page.value | Where-Object { $_.name -like "$baseName*" } | Select-Object -First 1
+                if ($hit) { break }
+              }
+              $next = $page.'@odata.nextLink'
+            }
+
+            if ($hit) {
+              Write-Host "A policy with MEC $latestVersion already exists: '$($hit.name)' (id: $($hit.id)). Skipping creation."
+              Write-Host "##vso[task.setvariable variable=newPolicyId]$($hit.id)"
+              Write-Host "##vso[task.setvariable variable=newPolicyName]$($hit.name)"
+              return
+            }
+
+            $createBody = [ordered]@{
+              "@odata.type"   = "#microsoft.graph.deviceManagementConfigurationPolicy"
+              name            = $newName
+              description     = "Auto-cloned from $($srcPolicy.name) with updated Office Target Version $latestVersion"
+              platforms       = $srcPolicy.platforms
+              technologies    = $srcPolicy.technologies
+              roleScopeTagIds = $srcPolicy.roleScopeTagIds
+              settings        = $newSettings
+            } | ConvertTo-Json -Depth 100
+
+            $newPolicy = Invoke-RestMethod -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies" `
+              -Headers $headers -Method Post -Body $createBody
+
+            $newId = $newPolicy.id
+            if (-not $newId) { throw "Failed to create new policy." }
+
+            Write-Host "Created new policy (unassigned): $newName ($newId)"
+            Write-Host "##vso[task.setvariable variable=newPolicyId]$newId"
+            Write-Host "##vso[task.setvariable variable=newPolicyName]$newName"
+
+      # 5) Verify Target Version on the NEW policy
+      - task: PowerShell@2
+        displayName: "Verify new policy Target Version"
+        env:
+          secretToken: $(secretToken)
+        inputs:
+          targetType: inline
+          pwsh: true
+          script: |
+            $ErrorActionPreference = 'Stop'
+            $newId           = "$(newPolicyId)"
+            $newName         = "$(newPolicyName)"
+            $childStringDefId = "$(settingId)"
+            $latestVersion   = "$(latestVersion)"
+            if (-not $newId) { throw "Missing newPolicyId pipeline variable." }
+
+            $headers = @{ Authorization = "Bearer $env:secretToken" }
+            $uri = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies/$newId/settings"
+            $resp = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+
+            $verChild = $resp.value.settingInstance.choiceSettingValue.children |
+              Where-Object { $_.settingDefinitionId -eq $childStringDefId } |
+              Select-Object -First 1
+
+            if (-not $verChild -or -not $verChild.simpleSettingValue) {
+              throw "Verification failed: could not read Office Target Version on new policy."
+            }
+
+            $current = $verChild.simpleSettingValue.value
+            Write-Host "New policy '$newName' ($newId) Target Version: $current (expected $latestVersion)"
+
+            # Upload a short summary card to the job log
+            $lines = @(
+              "# New Policy Verification",
+              "",
+              "- New Policy Name: $newName",
+              "- New Policy ID: $newId",
+              "- Office Target Version (new): $current",
+              "- Expected: $latestVersion"
+            )
+            $path = "$(Agent.TempDirectory)/new-policy-verify.md"
+            $lines -join "`n" | Out-File -FilePath $path -Encoding utf8
+            Write-Host "##vso[task.uploadsummary]$path"
+
+      # 6) (Optional) Assign the new policy to an existing Entra ID (Azure AD) group
+      - task: PowerShell@2
+        displayName: "Assign new policy to group (optional)"
+        condition: and(
+                    succeeded(),
+                    eq(variables['assignToGroup'], 'true'),
+                    ne(variables['newPolicyId'], ''),
+                    ne(variables['newPolicyId'], variables['policyId'])
+                  )
+        env:
+          secretToken: $(secretToken)
+        inputs:
+          targetType: inline
+          pwsh: true
+          script: |
+            $ErrorActionPreference = 'Stop'
+
+            $newId          = "$(newPolicyId)"
+            $newName        = "$(newPolicyName)"
+            $assignGroupBy  = "$(assignGroupBy)"
+            $targetGroupId  = "$(targetGroupId)"
+            $targetGroupName= "$(targetGroupName)"
+
+            if (-not $newId) { throw "No new policy id available to assign." }
+
+            if ($newId -eq "$(policyId)") {
+              throw "Safety check: newPolicyId equals source policyId — refusing to assign."
+            }
+            $hdrCheck = @{ Authorization = "Bearer $env:secretToken" }
+            $polCheck = Invoke-RestMethod -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies/$newId" -Headers $hdrCheck -Method Get
+            if ($polCheck.description -notlike "*Auto-cloned from*") {
+              throw "Safety check: target policy doesn't have the expected 'Auto-cloned' marker in description. Aborting assignment."
+            }
+            Write-Host "About to assign policy: $($polCheck.name) ($($polCheck.id))"
+
+            $headers = @{
+              Authorization = "Bearer $env:secretToken"
+              "Content-Type" = "application/json"
+              "Accept"       = "application/json"
+            }
+
+            # Resolve group id (by id or by displayName)
+            if ($assignGroupBy -eq 'id') {
+              if ([string]::IsNullOrWhiteSpace($targetGroupId)) { throw "assignGroupBy='id' but targetGroupId is empty." }
+              $groupId = $targetGroupId
+            } elseif ($assignGroupBy -eq 'name') {
+              if ([string]::IsNullOrWhiteSpace($targetGroupName)) { throw "assignGroupBy='name' but targetGroupName is empty." }
+              # Exact match on displayName (v1.0 is fine for groups lookup)
+              $url = "https://graph.microsoft.com/v1.0/groups?`$select=id,displayName&`$filter=displayName eq '$($targetGroupName.Replace("'","''"))'"
+              $g = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+              if (-not $g.value -or $g.value.Count -eq 0) { throw "Group '$targetGroupName' not found." }
+              if ($g.value.Count -gt 1) { throw "Multiple groups named '$targetGroupName' found. Use assignGroupBy='id'." }
+              $groupId = $g.value[0].id
+            } else {
+              throw "assignGroupBy must be 'id' or 'name'. Current: $assignGroupBy"
+            }
+
+            Write-Host "Assigning policy '$newName' ($newId) to groupId: $groupId"
+
+            # Build assignments payload (include group; to exclude use #microsoft.graph.exclusionGroupAssignmentTarget)
+            $assignBody = @{
+              assignments = @(
+                @{
+                  target = @{
+                    "@odata.type" = "#microsoft.graph.groupAssignmentTarget"
+                    groupId       = $groupId
+                  }
+                }
+              )
+            } | ConvertTo-Json -Depth 10
+
+            $assignUri = "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies/$newId/assign"
+            Invoke-RestMethod -Uri $assignUri -Headers $headers -Method Post -Body $assignBody | Out-Null
+
+            Write-Host "Assignment submitted."
+
+            # Quick verify
+            $as = Invoke-RestMethod -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies/$newId/assignments" -Headers $headers -Method Get
+            $ok = $as.value | Where-Object { $_.target.groupId -eq $groupId }
+            if ($ok) {
+              Write-Host "Verified: Assignment exists for group $groupId."
+            } else {
+              Write-Warning "Assignment not visible yet; it may take a moment to appear."
+            }
