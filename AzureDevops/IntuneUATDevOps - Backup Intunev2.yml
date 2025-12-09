@@ -1,0 +1,385 @@
+trigger: none
+
+schedules:
+  - cron: "0 1 * * *"
+    displayName: "1am every day"
+    branches:
+      include:
+        - main
+    always: true
+
+variables:
+  - name: BACKUP_FOLDER
+    value: prod-backup
+  - name: TENANT_NAME
+    value: XXXXXXXXXXXXXXX.com
+  - name: SERVICE_CONNECTION_NAME
+    value: XXXXXXXXXXXXXXXXXXXXXX
+  - name: USER_EMAIL
+    value: XXXXXXXXXX@XXXXXXX.COM
+  - name: USER_NAME
+    value: IT_Intune_Backupper
+
+jobs:
+  - job: backup_intune
+    displayName: Backup & commit Intune configuration
+    pool:
+      vmImage: ubuntu-latest
+    continueOnError: false
+
+    steps:
+      - checkout: self
+        persistCredentials: true
+
+      - task: Bash@3
+        displayName: Remove existing prod-backup directory
+        inputs:
+          targetType: "inline"
+          script: |
+            rm -rfv "$(Build.SourcesDirectory)/$(BACKUP_FOLDER)"
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: false
+
+      - task: Bash@3
+        displayName: Install IntuneCD
+        inputs:
+          targetType: "inline"
+          script: |
+            pip3 install IntuneCD
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: true
+
+      - task: AzureCLI@2
+        displayName: "Get Graph Token for Workload Federated Credential"
+        inputs:
+          azureSubscription: $(SERVICE_CONNECTION_NAME)
+          scriptType: "pscore"
+          scriptLocation: "inlineScript"
+          inlineScript: |
+            $token = az account get-access-token --resource-type ms-graph
+            $accessToken = ($token | ConvertFrom-Json).accessToken
+            Write-Host "##vso[task.setvariable variable=secretToken;issecret=true]$accessToken"
+
+      - task: Bash@3
+        displayName: Create Intune backup
+        inputs:
+          targetType: "inline"
+          script: |
+            mkdir -p "$(Build.SourcesDirectory)/$(BACKUP_FOLDER)"
+
+            BACKUP_START=$(date +%Y.%m.%d:%H.%M.%S)
+            echo "##vso[task.setVariable variable=BACKUP_START]$BACKUP_START"
+
+            IntuneCD-startbackup \
+              -t "$(secretToken)" \
+              --mode=1 \
+              --output=json \
+              --path="$(Build.SourcesDirectory)/$(BACKUP_FOLDER)" \
+              --exclude CompliancePartnerHeartbeat ManagedGooglePlay VPPusedLicenseCount \
+              --append-id \
+              --ignore-omasettings
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: true
+
+      - task: PowerShell@2
+        displayName: Find change author & commit the backup
+        name: commitAndSetVariable
+        env:
+          secretToken: $(secretToken)
+        inputs:
+          targetType: "inline"
+          script: |
+            $root = "$(Build.SourcesDirectory)"
+            Set-Location $root
+
+            # Configure GIT defaults
+            git config --global user.name 'unknown'
+            git config --global user.email 'unknown@unknown.com'
+            git config --global core.longpaths true
+            git config --global core.quotepath off
+            git config --global core.eol lf
+            git config --global core.autocrlf false
+
+            #region helper functions
+
+            function _startProcess {
+              [CmdletBinding()]
+              param (
+                [string] $filePath = '',
+                [string] $argumentList = '',
+                [string] $workingDirectory = (Get-Location),
+                [switch] $dontWait,
+                [switch] $outputErr2Std
+              )
+
+              $p = New-Object System.Diagnostics.Process
+              $p.StartInfo.UseShellExecute = $false
+              $p.StartInfo.RedirectStandardOutput = $true
+              $p.StartInfo.RedirectStandardError = $true
+              $p.StartInfo.WorkingDirectory = $workingDirectory
+              $p.StartInfo.FileName = $filePath
+              $p.StartInfo.Arguments = $argumentList
+              [void]$p.Start()
+              if (!$dontWait) {
+                $p.WaitForExit()
+              }
+
+              $result = $p.StandardOutput.ReadToEnd()
+              if ($result) { $result }
+              if ($outputErr2Std) {
+                $p.StandardError.ReadToEnd()
+              } else {
+                if ($err = $p.StandardError.ReadToEnd()) {
+                  Write-Error $err
+                }
+              }
+            }
+
+            function _getResourceId {
+              [CmdletBinding()]
+              param (
+                [string] $filePath
+              )
+
+              $fileName = [System.IO.Path]::GetFileNameWithoutExtension($filePath)
+
+              if ($filePath -like "*Device Configurations/mobileconfig/*") {
+                $parentFolderPath = Split-Path (Split-Path $filePath -Parent) -Parent
+                if (Test-Path $parentFolderPath) {
+                  $fileName = Get-ChildItem $parentFolderPath -File | Where-Object {
+                    (ConvertFrom-Json -InputObject (Get-Content $_.FullName -Raw)).payloadFileName -eq [System.IO.Path]::GetFileName($filePath)
+                  } | Select-Object -ExpandProperty BaseName
+                } else {
+                  Write-Warning "Parent folder '$parentFolderPath' not found for $filePath"
+                  return
+                }
+                if (!$fileName) {
+                  Write-Warning "Unable to find 'parent' config file for $filePath"
+                  return
+                }
+              } elseif ($filePath -like "*/Managed Google Play/*") {
+                return ($modificationEvent | ? { $_.Category -eq 'Enrollment' -and $_.ActivityType -eq "Patch AndroidForWorkSettings" }).Resources.ResourceId
+              }
+
+              $delimiter = "__"
+              if ($fileName -like "*$delimiter*") {
+                $resourceId = ($fileName -split $delimiter)[-1]
+                $resourceId = $resourceId -replace "^_*"
+              } else {
+                $resourceId = $null
+              }
+
+              return $resourceId
+            }
+
+            function Invoke-WithGraphRetry {
+              [CmdletBinding()]
+              param(
+                [Parameter(Mandatory = $true)][scriptblock]$Action,
+                [int]$MaxRetries = 5,
+                [int]$InitialDelaySeconds = 5
+              )
+              $retryCount = 0
+              $delay = $InitialDelaySeconds
+              while ($retryCount -lt $MaxRetries) {
+                try {
+                  return & $Action
+                } catch {
+                  if ($_.Exception.Message -match "TooManyRequests") {
+                    Write-Warning "Rate limit encountered. Waiting $delay seconds before retry (Attempt $($retryCount + 1) of $MaxRetries)..."
+                    Start-Sleep -Seconds $delay
+                    $retryCount++
+                    $delay *= 2
+                  } else {
+                    throw $_
+                  }
+                }
+              }
+              throw "Exceeded maximum retries for Graph API call."
+            }
+
+            #endregion helper functions
+
+            # Detect changes
+            $untrackedFile = git ls-files --others --exclude-standard --full-name
+            $trackedFile = git ls-files --modified --full-name
+            $changedFile = $untrackedFile + $trackedFile | Where-Object { $_ }
+
+            if ($changedFile) {
+              echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]1"
+
+              # Install Graph module if needed
+              if (!(Get-Module "Microsoft.Graph.DeviceManagement.Administration" -ListAvailable)) {
+                Install-Module Microsoft.Graph.DeviceManagement.Administration -AllowClobber -Force -AcceptLicense
+              }
+
+              Write-Host "Authenticating to Microsoft Graph using federated identity token"
+              $accessToken = $env:secretToken
+              $secureAccessToken = ConvertTo-SecureString $accessToken -AsPlainText -Force
+              Connect-MgGraph -AccessToken $secureAccessToken -NoWelcome
+
+              # Fetch last commit info
+              $gitCommitDepth = 30
+              git fetch --depth=$gitCommitDepth
+              $commitList = _startProcess git "--no-pager log --no-show-signature -$gitCommitDepth --format=%s%%%%%%%cI" -outputErr2Std -dontWait
+              $lastCommitDate = $commitList -split "`n" | Where-Object { $_ } | ForEach-Object {
+                $commitName, $commitDate = $_ -split "%%%"
+                if ($commitName -match "^\d{4}\.\d{2}\.\d{2}_\d{2}\.\d{2} -- ") {
+                  $commitDate
+                }
+              } | Select-Object -First 1
+
+              if ($lastCommitDate) {
+                $lastCommitDate = Get-Date $lastCommitDate
+              } else {
+                Write-Warning "Unable to get last backup commit date. Pulling all events."
+              }
+
+              $modificationData = New-Object System.Collections.ArrayList
+
+              # Get audit logs from Graph
+              $filter = @("activityResult eq 'Success'", "ActivityOperationType ne 'Get'")
+              if ($lastCommitDate) {
+                $filterDateTimeFrom = $lastCommitDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss") + "Z"
+                $filter += "ActivityDateTime ge $filterDateTimeFrom"
+              }
+
+              $backupStart = [DateTime]::ParseExact('$(BACKUP_START)', 'yyyy.MM.dd:HH.mm.ss', $null).ToUniversalTime()
+              if (-not $lastCommitDate) {
+                $lastCommitDate = $backupStart.AddDays(-1)
+              }
+              $filterDateTimeTo = $backupStart.ToString("yyyy-MM-ddTHH:mm:ss") + "Z"
+              $filter += "ActivityDateTime le $filterDateTimeTo"
+
+              $eventFilter = $filter -join " and "
+              Write-Host "`nGetting Intune logs from '$lastCommitDate' to '$backupStart'"
+              Write-Host "`tFilter: $eventFilter"
+
+              try {
+                $modificationEvent = Invoke-WithGraphRetry -Action { Get-MgDeviceManagementAuditEvent -Filter $eventFilter -All }
+              } catch {
+                Write-Warning "Failed to get audit events: $_"
+                $modificationEvent = @()
+              }
+
+              "`nProcessing changed files"
+              foreach ($file in $changedFile) {
+                $resourceId = _getResourceId $file
+                $modificationAuthorUPN = @()
+
+                if ($resourceId) {
+                  "`t- $resourceId ($file)"
+                  $resourceModificationEvent = $modificationEvent | Where-Object { $_.Resources.ResourceId -eq $resourceId }
+                  $resourceModificationEvent.Actor | ForEach-Object {
+                    if ($_.UserPrincipalName) {
+                      $modificationAuthorUPN += $_.UserPrincipalName
+                    } elseif ($_.ApplicationDisplayName) {
+                      $modificationAuthorUPN += ($_.ApplicationDisplayName + " (SP)")
+                    }
+                  }
+                } else {
+                  if ($file -notlike "*/Assignment Report/report.json" -and $file -notlike "*Device Management Settings/settings.json" -and $file -notlike "*/Apple Push Notification/*" -and $file -notlike "*/Managed Google Play/*" -and $file -notlike "*Device Configurations/mobileconfig/*" -and $file -notlike "*.md") {
+                    throw "Unable to determine resourceId for '$file'"
+                  }
+                }
+
+                $modificationAuthorUPN = $modificationAuthorUPN | Select-Object -Unique | Sort-Object
+                if (-not $modificationAuthorUPN) {
+                  Write-Host "`t`t- unable to find out who made the change"
+                  $modificationAuthorUPN = 'unknown@unknown.com'
+                } else {
+                  Write-Host "`t`t- changed by: $($modificationAuthorUPN -join ', ')"
+                }
+
+                $null = $modificationData.Add([PSCustomObject]@{
+                  resourceId            = $resourceId
+                  file                  = Join-Path $root $file
+                  modificationAuthorUPN = $modificationAuthorUPN
+                })
+              }
+
+              "`nCommitting changes..."
+              $modificationData | Group-Object { $_.modificationAuthorUPN -join '&' } | ForEach-Object {
+                $modificationAuthorUPN = $_.Group.modificationAuthorUPN | Select-Object -Unique
+                $modificationAuthorName = $modificationAuthorUPN | ForEach-Object { $_.Split('@')[0] }
+                $modifiedFile = $_.Group.File
+
+                foreach ($filePath in $modifiedFile) {
+                  "`t- Adding $filePath"
+                  $gitResult = _startProcess git -ArgumentList "add `"$filePath`"" -dontWait -outputErr2Std
+                  if ($gitResult -match "^fatal:") { throw $gitResult }
+                }
+
+                git config user.name ($modificationAuthorName -join ', ')
+                git config user.email ($modificationAuthorUPN -join ', ')
+                $DATEF = "$(Get-Date $backupStart -f yyyy.MM.dd_HH.mm)"
+                $commitName = "$DATEF -- $($modificationAuthorName -join ', ')"
+
+                "`t- Committing as '$commitName'"
+                _startProcess git -ArgumentList "commit -m `"$commitName`"" -dontWait
+
+                $unpushed = _startProcess git -ArgumentList "cherry -v origin/main"
+                if (-not $unpushed) {
+                  Write-Warning "Nothing to commit?!"
+                  echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]0"
+                } else {
+                  "`t`t- Commit was created"
+                  echo "##vso[task.setVariable variable=COMMIT_DATE;isOutput=true;]$DATEF"
+                  echo "##vso[task.setVariable variable=MODIFICATION_AUTHOR;isOutput=true;]$(($modificationData.modificationAuthorUPN | select -Unique | Sort-Object) -join ', ')"
+                }
+              }
+
+              "`nPushing changes"
+              _startProcess git -ArgumentList "push origin HEAD:main" -dontWait -outputErr2Std
+
+            } else {
+              Write-Host "No changes detected. Skipping commit."
+              echo "##vso[task.setVariable variable=CHANGE_DETECTED;isOutput=true;]0"
+            }
+
+  - job: tag
+    displayName: Tag repo
+    dependsOn: backup_intune
+    condition: and(succeeded(), eq(dependencies.backup_intune.outputs['commitAndSetVariable.CHANGE_DETECTED'], '1'))
+    pool:
+      vmImage: ubuntu-latest
+    continueOnError: false
+    variables:
+      COMMIT_DATE: $[ dependencies.backup_intune.outputs['commitAndSetVariable.COMMIT_DATE'] ]
+      MODIFICATION_AUTHOR: $[ dependencies.backup_intune.outputs['commitAndSetVariable.MODIFICATION_AUTHOR'] ]
+    steps:
+      - checkout: self
+        persistCredentials: true
+        
+      - task: Bash@3
+        displayName: Configure Git
+        inputs:
+          targetType: "inline"
+          script: |
+            git config --global user.name "$(USER_NAME)"
+            git config --global user.email "$(USER_EMAIL)"
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: true
+
+      - task: Bash@3
+        displayName: Pull origin
+        inputs:
+          targetType: "inline"
+          script: |
+            git pull origin main
+          workingDirectory: "$(Build.SourcesDirectory)"
+          failOnStderr: false
+
+      - task: PowerShell@2
+        displayName: Git tag
+        inputs:
+          targetType: "inline"
+          script: |
+            # sanitize tag
+            $DATEF = "$(COMMIT_DATE)" -replace "[:]", "."
+            "Creating TAG '$DATEF'"
+            git tag -a "$DATEF" -m "$DATEF -- Intune configuration snapshot (changes made by: $(MODIFICATION_AUTHOR))"
+            git push origin "$DATEF" *> $null
+          failOnStderr: true
+          pwsh: true
+          workingDirectory: "$(Build.SourcesDirectory)"# ...rest of steps...
