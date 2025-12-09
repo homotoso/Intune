@@ -2,11 +2,11 @@
 Connect-MgGraph -Identity
 
 # Get the group of users
-$usersGroup = Get-MgGroup -Filter "DisplayName eq 'MDM - Ring 2 - Testers Users Azure'"
+$usersGroup = Get-MgGroup -Filter "DisplayName eq 'XXXXXXXXXXXXXXXXXXXXX'"
 
 # Get the devices group
 #$devicesGroup = Get-AzureADGroup -SearchString "Devices Group"
-$devicesGroup = Get-MgGroup -Filter "DisplayName eq 'MDM - Ring 2 - Testers Devices'"
+$devicesGroup = Get-MgGroup -Filter "DisplayName eq 'XXXXXXXXXXXXXXXXXXXXXXXXXX'"
 
 # Get all the users in the users group
 $users = Get-MgGroupMemberAsUser -All -GroupId $usersGroup.Id
