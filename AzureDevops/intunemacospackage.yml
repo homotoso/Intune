@@ -1,0 +1,90 @@
+trigger: none
+
+parameters:
+- name: packageFormat
+  displayName: Package format to produce
+  type: string
+  default: dmg
+  values:
+  - dmg
+  - pkg
+
+pool:
+  vmImage: 'macos-latest'
+
+variables:
+  GH_ARCH: 'darwin-arm64'   # Apple Silicon only
+
+stages:
+- stage: Build
+  displayName: Build GitHub Desktop (${{ parameters.packageFormat }})
+  jobs:
+  - job: BuildAppleSilicon
+    displayName: Build GitHub Desktop (Apple Silicon)
+    steps:
+    - checkout: self
+      clean: true
+
+    - bash: |
+        set -euo pipefail
+
+        OUTDIR="$(Build.SourcesDirectory)/IntuneMacOSPackages"
+        mkdir -p "$OUTDIR" work unzip stage
+
+        DOWNLOAD_URL="https://central.github.com/deployments/desktop/desktop/latest/$(GH_ARCH)"
+        echo "Downloading: $DOWNLOAD_URL"
+        curl -fL -o "work/GitHubDesktop.zip" "$DOWNLOAD_URL"
+
+        echo "Unzipping..."
+        unzip -q "work/GitHubDesktop.zip" -d "unzip"
+
+        APP_PATH=`find unzip -maxdepth 4 -name '*.app' -print -quit`
+        if [ -z "$APP_PATH" ]; then
+          echo "ERROR: No .app found in the downloaded ZIP."
+          find unzip -maxdepth 4 -print
+          exit 1
+        fi
+        echo "Found app: $APP_PATH"
+
+        BUNDLE_ID=`/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Contents/Info.plist"`
+        APP_VER=`/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist"`
+        BUILD_VER=`/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Contents/Info.plist" 2>/dev/null || true`
+
+        cat > "$OUTDIR/IntuneMetadata-$(GH_ARCH).txt" <<EOF
+        BundleId: $BUNDLE_ID
+        Version: $APP_VER
+        Build: $BUILD_VER
+        Arch: $(GH_ARCH)
+        DownloadUrl: $DOWNLOAD_URL
+        EOF
+
+        rm -rf stage
+        mkdir -p stage
+        cp -R "$APP_PATH" "stage/"
+
+        if [ '${{ parameters.packageFormat }}' = 'dmg' ]; then
+          OUT="$OUTDIR/GitHubDesktop-${APP_VER}-$(GH_ARCH).dmg"
+          echo "Creating DMG: $OUT"
+          hdiutil create -volname "GitHub Desktop" \
+            -srcfolder "stage" \
+            -ov -format UDZO \
+            "$OUT"
+        else
+          OUT="$OUTDIR/GitHubDesktop-${APP_VER}-$(GH_ARCH).pkg"
+          echo "Creating PKG (unsigned): $OUT"
+          APP_NAME=`basename "$APP_PATH"`
+          pkgbuild \
+            --component "stage/$APP_NAME" \
+            --install-location "/Applications" \
+            --identifier "$BUNDLE_ID" \
+            --version "$APP_VER" \
+            "$OUT"
+        fi
+
+        echo "Output folder contents:"
+        ls -lah "$OUTDIR"
+      displayName: Build ${{ parameters.packageFormat }} for Apple Silicon
+
+    - publish: $(Build.SourcesDirectory)/IntuneMacOSPackages
+      artifact: IntuneMacOSPackages-apple-silicon-${{ parameters.packageFormat }}
+      displayName: Publish IntuneMacOSPackages artifact
